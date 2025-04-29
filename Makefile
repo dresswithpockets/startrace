@@ -10,9 +10,6 @@ rundebug: out/trace.exe
 runrelease: out/trace-release.exe
 	out/trace-release.exe
 
-out/test.ppm: out/trace.exe
-	out/trace.exe > out/test.ppm
-
 .PHONY: clean
 
 clean:
