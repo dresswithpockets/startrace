@@ -4,3 +4,5 @@ out/*
 *.ppm
 
 ols.json
+
+remedy/
