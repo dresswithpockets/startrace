@@ -5,24 +5,16 @@ import "core:fmt"
 import "core:math"
 import "core:math/linalg"
 import "core:math/rand"
+import "core:mem"
 import "core:os"
+import "core:thread"
+import "core:time"
 import "vendor:stb/image"
 
 Vector3 :: linalg.Vector3f64
 Color :: linalg.Vector3f64
 
-/*
-coordinate systems:
-X+ right
-Y+ up
-Z+ forward
-
-Camera Facing: Z+
-*/
-
 FORWARD :: Vector3{0, 0, 1}
-UP :: Vector3{0, 0.002, 0}
-RIGHT :: Vector3{0.002, 0, 0}
 
 Ray :: struct {
     origin:    Vector3,
@@ -48,18 +40,6 @@ Object :: union {
     Triangle,
     Sphere,
     Plane,
-}
-
-object_material :: proc(object: Object) -> Material {
-    switch o in object {
-    case Triangle:
-        return o.material
-    case Sphere:
-        return o.material
-    case Plane:
-        return o.material
-    }
-    return Material{}
 }
 
 Triangle :: struct {
@@ -250,7 +230,7 @@ Scene :: struct {
     light:     Light,
 }
 
-scene_trace_all :: proc(scene: Scene, ray: Ray) -> (trace: Trace_Info, object: Object) {
+scene_trace_all :: proc(scene: ^Scene, ray: Ray) -> (trace: Trace_Info, object: Object) {
     trace = Trace_Info {
         distance = math.F64_MAX,
     }
@@ -280,7 +260,7 @@ scene_trace_all :: proc(scene: Scene, ray: Ray) -> (trace: Trace_Info, object: O
     return
 }
 
-scene_trace_any :: proc(scene: Scene, ray: Ray) -> bool {
+scene_trace_any :: proc(scene: ^Scene, ray: Ray) -> bool {
     trace_info: Trace_Info
     for triangle in scene.triangles {
         if trace_ray_triangle(&trace_info, ray, triangle) {
@@ -297,6 +277,103 @@ scene_trace_any :: proc(scene: Scene, ray: Ray) -> bool {
 
 rand_offset :: proc() -> f64 {
     return rand.float64_range(-0.5, 0.5)
+}
+
+Render_Pixel_Job :: struct {
+    pool:         ^thread.Pool,
+    stride:       int,
+    size:         int,
+    offset:       int,
+    bounces:      int,
+    samples:      int,
+    color_buffer: []Color,
+    scene:        ^Scene,
+}
+
+render_pixel_color :: proc(step_size: f64, x, y: int, bounces: int, samples: int, scene: ^Scene) -> Color {
+    average_color: Color
+    for _ in 0 ..< samples {
+        ray := Ray {
+            origin    = Vector3{0, 1, -4},
+            direction = linalg.normalize(
+                Vector3{step_size * (f64(x) - 0.5 + rand_offset()), step_size * (f64(y) - 0.5 + rand_offset()), 1},
+            ),
+        }
+
+        final_color: Color
+        ray_energy: f64 = 1.0
+
+        for _ in 0 ..< bounces {
+            nearest_trace, nearest_object := scene_trace_all(scene, ray)
+
+            random_light_offset := Vector3{rand_offset(), rand_offset(), rand_offset()} * scene.light.radius
+            light_origin := scene.light.origin + random_light_offset
+
+            // before we shade, determine if the point has line of sight of the scene light 
+            point_is_lit := !scene_trace_any(
+                scene,
+                Ray{origin = nearest_trace.point, direction = linalg.normalize(light_origin - nearest_trace.point)},
+            )
+
+            color: Color
+            reflective := 0.0
+            if nearest_object == nil {
+                color = get_sky_color(ray.direction)
+            } else {
+                reflective = nearest_trace.material.reflective
+                ray.origin = nearest_trace.point
+                ray.direction = nearest_trace.bounce_direction
+
+                // compute phong lighting objects
+                ambient_light := 0.3
+                color = nearest_trace.material.color * ambient_light
+
+                if point_is_lit {
+                    diffuse_light := max(
+                        0.0,
+                        linalg.dot(nearest_trace.normal, linalg.normalize(light_origin - nearest_trace.point)),
+                    )
+                    specular_light := max(
+                        0,
+                        linalg.dot(linalg.normalize(light_origin - nearest_trace.point), ray.direction),
+                    )
+                    color += nearest_trace.material.color * diffuse_light * nearest_trace.material.diffuse
+                    color +=
+                        scene.light.color *
+                        math.pow(specular_light, nearest_trace.material.hardness) *
+                        nearest_trace.material.specular
+                }
+            }
+
+            final_color += color * ray_energy * (1.0 - reflective)
+            ray_energy *= reflective
+            if ray_energy <= math.F64_EPSILON {
+                break
+            }
+        }
+
+        average_color += final_color
+    }
+
+    return average_color / f64(samples)
+}
+
+render_pixel_task :: proc(task: thread.Task) {
+    job := transmute(^Render_Pixel_Job)task.data
+    idx := task.user_index
+    for idx < len(job.color_buffer) {
+        view_x := job.offset - (idx % job.size)
+        view_y := (idx / job.size) - job.offset
+        job.color_buffer[len(job.color_buffer) - idx - 1] = render_pixel_color(
+            0.002,
+            view_x,
+            view_y,
+            job.bounces,
+            job.samples,
+            job.scene,
+        )
+        idx += job.stride
+    }
 }
 
 main :: proc() {
@@ -321,107 +398,47 @@ main :: proc() {
         light = Light{origin = {0, 100, -3}, color = {0.5, 0.5, 0.5}, radius = 10},
     }
 
-    AA_SAMPLES :: 128
-    BOUNCES :: 32
+    AA_SAMPLES :: 512
+    BOUNCES :: 30
     SIZE :: 1440
 
-    WIDTH_ALIGN :: SIZE - 1
-    UPPER :: SIZE / 2
-    LOWER :: (SIZE / 2) - 1
-    pixmap := new_pixmap(.HumanReadable, SIZE, SIZE, u8)
-    hdr_buffer := make([][3]f32, SIZE * SIZE)
+    BUFFER_SIZE :: SIZE * SIZE
+    color_buffer := make([]Color, BUFFER_SIZE)
 
-    for y in -LOWER ..= UPPER {
-        for x in -LOWER ..= UPPER {
-            anti_alias_color: Color
-            for _ in 0 ..< AA_SAMPLES {
-                ray := Ray {
-                    origin    = Vector3{0, 1, -4},
-                    direction = linalg.normalize(
-                        Vector3{0.002 * (f64(x) - 0.5 + rand_offset()), 0.002 * (f64(y) - 0.5 + rand_offset()), 1},
-                    ),
-                }
-
-                final_color: Color
-                ray_energy: f64 = 1.0
-
-                for _ in 0 ..< BOUNCES {
-                    nearest_trace, nearest_object := scene_trace_all(scene, ray)
-
-                    random_light_offset := Vector3{rand_offset(), rand_offset(), rand_offset()} * scene.light.radius
-                    light_origin := scene.light.origin + random_light_offset
-
-                    // before we shade, determine if the point has line of sight of the scene light 
-                    point_is_lit := !scene_trace_any(
-                        scene,
-                        Ray {
-                            origin = nearest_trace.point,
-                            direction = linalg.normalize(light_origin - nearest_trace.point),
-                        },
-                    )
-
-                    color: Color
-                    reflective := 0.0
-                    if nearest_object == nil {
-                        color = get_sky_color(ray.direction)
-                    } else {
-                        reflective = nearest_trace.material.reflective
-                        ray.origin = nearest_trace.point
-                        ray.direction = nearest_trace.bounce_direction
-
-                        // compute phong lighting objects
-                        ambient_light := 0.3
-                        color = nearest_trace.material.color * ambient_light
-
-                        if point_is_lit {
-                            diffuse_light := max(
-                                0.0,
-                                linalg.dot(nearest_trace.normal, linalg.normalize(light_origin - nearest_trace.point)),
-                            )
-                            specular_light := max(
-                                0,
-                                linalg.dot(linalg.normalize(light_origin - nearest_trace.point), ray.direction),
-                            )
-                            color += nearest_trace.material.color * diffuse_light * nearest_trace.material.diffuse
-                            color +=
-                                scene.light.color *
-                                math.pow(specular_light, nearest_trace.material.hardness) *
-                                nearest_trace.material.specular
-                        }
-                    }
-
-                    final_color += color * ray_energy * (1.0 - reflective)
-                    ray_energy *= reflective
-                    if ray_energy <= math.F64_EPSILON {
-                        break
-                    }
-                }
-
-                anti_alias_color += final_color
-            }
-
-            anti_alias_color /= f64(AA_SAMPLES)
-
-            // flip image vertically and horizontally when calculating idx
-            pixel_idx := len(pixmap.image) - 1 - ((WIDTH_ALIGN - (x + LOWER)) + (y + LOWER) * SIZE)
-            u8(math.round(math.remap_clamped(anti_alias_color.r, 0.0, 1.0, 0.0, f64(pixmap.element_max))))
-            pixmap.image[pixel_idx] = [3]u8 {
-                u8(math.round(math.remap_clamped(anti_alias_color.r, 0.0, 1.0, 0.0, f64(pixmap.element_max)))),
-                u8(math.round(math.remap_clamped(anti_alias_color.g, 0.0, 1.0, 0.0, f64(pixmap.element_max)))),
-                u8(math.round(math.remap_clamped(anti_alias_color.b, 0.0, 1.0, 0.0, f64(pixmap.element_max)))),
-            }
-            hdr_buffer[pixel_idx] = [3]f32{f32(anti_alias_color.r), f32(anti_alias_color.g), f32(anti_alias_color.b)}
-        }
+    // 24 threads across 24 logical processors
+    JOB_COUNT :: 24
+    render_pixel_job := Render_Pixel_Job {
+        stride       = JOB_COUNT,
+        size         = SIZE,
+        offset       = SIZE / 2,
+        bounces      = BOUNCES,
+        samples      = AA_SAMPLES,
+        color_buffer = color_buffer,
+        scene        = &scene,
     }
 
-    image.write_png(
-        "out/test.png",
-        pixmap.width,
-        pixmap.height,
-        3,
-        raw_data(pixmap.image),
-        pixmap.width * size_of([3]u8),
-    )
+    thread_pool: thread.Pool
+    thread.pool_init(&thread_pool, context.allocator, JOB_COUNT)
+    for job_idx in 0 ..< JOB_COUNT {
+        thread.pool_add_task(&thread_pool, context.allocator, render_pixel_task, &render_pixel_job, job_idx)
+    }
 
-    image.write_hdr("out/test.hdr", SIZE, SIZE, 3, &hdr_buffer[0][0])
+    thread.pool_start(&thread_pool)
+    thread.pool_finish(&thread_pool)
+
+    sdr_buffer := make([][3]u8, BUFFER_SIZE)
+    hdr_buffer := make([][3]f32, BUFFER_SIZE)
+    for color, idx in color_buffer {
+        // TODO: hdr-sdr tonemapping
+        pixel_idx := BUFFER_SIZE - idx - 1
+        sdr_buffer[idx] = [3]u8 {
+            u8(math.round(math.remap_clamped(color.r, 0, 1, 0, 255))),
+            u8(math.round(math.remap_clamped(color.g, 0, 1, 0, 255))),
+            u8(math.round(math.remap_clamped(color.b, 0, 1, 0, 255))),
+        }
+        hdr_buffer[idx] = [3]f32{f32(color.r), f32(color.g), f32(color.b)}
+    }
+
+    image.write_png("test.png", SIZE, SIZE, 3, &sdr_buffer[0][0], SIZE * size_of([3]u8))
+    image.write_hdr("test.hdr", SIZE, SIZE, 3, &hdr_buffer[0][0])
 }
